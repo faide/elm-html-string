@@ -9,13 +9,13 @@ module Html.Types exposing
     , toString
     )
 
-import Char
 import Html
 import Html.Attributes
 import Html.Events
 import Html.Keyed
 import Json.Decode as Decode exposing (Decoder, Value)
 import Json.Encode as Encode
+import Regex exposing (Regex)
 import String.Conversions
 
 
@@ -116,301 +116,431 @@ mapEventDecoder f eventDecoder =
                 )
 
 
+
+-- TO HTML
+
+
 toHtml : Html msg -> Html.Html msg
 toHtml node =
     case node of
         Node tagName attributes children ->
             case children of
                 NoChildren ->
-                    Html.node tagName (List.map attributeToHtml attributes) []
+                    Html.node tagName (List.concatMap (attributeToHtml tagName) attributes) []
 
                 Regular nodes ->
-                    Html.node tagName (List.map attributeToHtml attributes) (List.map toHtml nodes)
+                    Html.node tagName (List.concatMap (attributeToHtml tagName) attributes) (List.map toHtml nodes)
 
                 Keyed keyedNodes ->
-                    Html.Keyed.node tagName (List.map attributeToHtml attributes) (List.map (Tuple.mapSecond toHtml) keyedNodes)
+                    Html.Keyed.node tagName (List.concatMap (attributeToHtml tagName) attributes) (List.map (Tuple.mapSecond toHtml) keyedNodes)
 
         TextNode content ->
             Html.text content
 
 
-attributeToHtml : Attribute msg -> Html.Attribute msg
-attributeToHtml attribute =
+{-| An attribute as the browser's Elm sees it: the same attribute `toString` writes, so a program
+started on HTML written by `toString` finds nothing to change. Elm reads existing HTML back as
+attributes, so a property standing in for one (`className` for `class`) would be patched on start.
+
+The properties holding a form's live state (`value`, `checked`, `selected`) are set as properties
+too, or the page would show the first value after somebody changed it; but not an option's `value`,
+a property that writes its attribute back.
+
+-}
+attributeToHtml : String -> Attribute msg -> List (Html.Attribute msg)
+attributeToHtml tagName attribute =
     case attribute of
         Attribute key value ->
-            Html.Attributes.attribute key value
+            [ Html.Attributes.attribute key value ]
 
         StringProperty key value ->
-            Html.Attributes.property key (Encode.string value)
+            if isLive key && not (tagName == "option" && key == "value") then
+                [ Html.Attributes.attribute (attributeName key) value, Html.Attributes.property key (Encode.string value) ]
+
+            else
+                [ Html.Attributes.attribute (attributeName key) value ]
 
         BoolProperty key value ->
-            Html.Attributes.property key (Encode.bool value)
+            let
+                present =
+                    if value then
+                        [ Html.Attributes.attribute (attributeName key) "" ]
+
+                    else
+                        []
+            in
+            if isLive key then
+                Html.Attributes.property key (Encode.bool value) :: present
+
+            else
+                present
 
         ValueProperty key value ->
-            Html.Attributes.property key value
+            [ Html.Attributes.property key value ]
 
         Style key value ->
-            Html.Attributes.style key value
+            [ Html.Attributes.style key value ]
 
         Event name (Normal d) ->
-            Html.Events.on name d
+            [ Html.Events.on name d ]
 
         Event name (MayStopPropagation d) ->
-            Html.Events.stopPropagationOn name d
+            [ Html.Events.stopPropagationOn name d ]
 
         Event name (MayPreventDefault d) ->
-            Html.Events.preventDefaultOn name d
+            [ Html.Events.preventDefaultOn name d ]
 
         Event name (Custom d) ->
-            Html.Events.custom name d
+            [ Html.Events.custom name d ]
 
 
+isLive : String -> Bool
+isLive key =
+    key == "value" || key == "checked" || key == "selected"
+
+
+
+-- TO STRING
+
+
+{-| The HTML of a node: on one line with an indent of 0, or a node per line, indented by `indent`
+spaces per level.
+
+Each tag and each text is one string, gathered in a list, last first, and the list is joined once at
+the end: joining the page piece by piece would copy it over and over. The tags themselves are built
+with `++`, a single call where adding to a list costs three, which counts in an interpreter.
+
+-}
 toString : Int -> Html msg -> String
-toString depth html =
-    let
-        indenter : Indenter
-        indenter =
-            case depth of
-                0 ->
-                    always identity
+toString indent html =
+    if indent <= 0 then
+        written [ html ] [] []
+            |> List.reverse
+            |> String.concat
 
-                _ ->
-                    indent depth
-
-        joinString : String
-        joinString =
-            case depth of
-                0 ->
-                    ""
-
-                _ ->
-                    "\n"
-
-        initialAcc : Acc msg
-        initialAcc =
-            { depth = 0
-            , stack = []
-            , result = []
-            }
-    in
-    toStringHelper indenter [ html ] initialAcc
-        |> .result
-        |> join joinString
+    else
+        lines (String.repeat indent " ") "" [ html ] [] []
+            |> List.reverse
+            |> String.join "\n"
 
 
-join : String -> List String -> String
-join between list =
-    case list of
+{-| The tags still open, each with the nodes that follow it.
+-}
+type alias Open msg =
+    List ( String, List (Html msg) )
+
+
+written : List (Html msg) -> Open msg -> List String -> List String
+written nodes open out =
+    case nodes of
         [] ->
-            ""
-
-        [ x ] ->
-            x
-
-        x :: xs ->
-            List.foldl (\y acc -> y ++ between ++ acc) x xs
-
-
-type alias Indenter =
-    Int -> String -> String
-
-
-type alias Acc msg =
-    { depth : Int
-    , stack : List (TagInfo msg)
-    , result : List String
-    }
-
-
-type alias TagInfo msg =
-    ( String, List (Html msg) )
-
-
-toStringHelper : Indenter -> List (Html msg) -> Acc msg -> Acc msg
-toStringHelper indenter tags acc =
-    case tags of
-        [] ->
-            case acc.stack of
+            case open of
                 [] ->
-                    acc
+                    out
 
-                ( tagName, cont ) :: rest ->
-                    toStringHelper indenter
-                        cont
-                        { acc
-                            | result = indenter (acc.depth - 1) (closingTag tagName) :: acc.result
-                            , depth = acc.depth - 1
-                            , stack = rest
-                        }
+                ( tagName, after ) :: outer ->
+                    written after outer (("</" ++ tagName ++ ">") :: out)
+
+        (TextNode text) :: rest ->
+            written rest open (textIn open text :: out)
 
         (Node tagName attributes children) :: rest ->
             case children of
                 NoChildren ->
-                    toStringHelper indenter
-                        rest
-                        { acc | result = indenter acc.depth (tag tagName attributes) :: acc.result }
+                    written rest open (startTag tagName attributes :: out)
 
-                Regular childNodes ->
-                    toStringHelper indenter
-                        childNodes
-                        { acc
-                            | result = indenter acc.depth (tag tagName attributes) :: acc.result
-                            , depth = acc.depth + 1
-                            , stack = ( tagName, rest ) :: acc.stack
-                        }
+                Regular [] ->
+                    if isVoid tagName then
+                        written rest open (startTag tagName attributes :: out)
 
-                Keyed childNodes ->
-                    toStringHelper indenter
-                        (List.map Tuple.second childNodes)
-                        { acc
-                            | result = indenter acc.depth (tag tagName attributes) :: acc.result
-                            , depth = acc.depth + 1
-                            , stack = ( tagName, rest ) :: acc.stack
-                        }
+                    else
+                        written rest open ((startTag tagName attributes ++ "</" ++ tagName ++ ">") :: out)
 
-        (TextNode string) :: rest ->
-            toStringHelper indenter
-                rest
-                { acc | result = indenter acc.depth (escapeHtmlText string) :: acc.result }
+                Regular inner ->
+                    written inner (( tagName, rest ) :: open) (startTag tagName attributes :: out)
+
+                Keyed inner ->
+                    written (List.map Tuple.second inner) (( tagName, rest ) :: open) (startTag tagName attributes :: out)
 
 
-tag : String -> List (Attribute msg) -> String
-tag tagName attributes =
-    "<" ++ String.join " " (tagName :: attributesToString attributes) ++ ">"
-
-
-escapeHtmlText : String -> String
-escapeHtmlText =
-    String.replace "&" "&amp;"
-        >> String.replace "<" "&lt;"
-        >> String.replace ">" "&gt;"
-
-
-attributesToString : List (Attribute msg) -> List String
-attributesToString attrs =
-    let
-        ( classes, styles, regular ) =
-            List.foldl addAttribute ( [], [], [] ) attrs
-    in
-    regular
-        |> withClasses classes
-        |> withStyles styles
-
-
-withClasses : List String -> List String -> List String
-withClasses classes attrs =
-    case classes of
+{-| A node per line, indented by its depth.
+-}
+lines : String -> String -> List (Html msg) -> Open msg -> List String -> List String
+lines unit indentation nodes open out =
+    case nodes of
         [] ->
-            attrs
+            case open of
+                [] ->
+                    out
+
+                ( tagName, after ) :: outer ->
+                    let
+                        outerIndentation =
+                            String.dropLeft (String.length unit) indentation
+                    in
+                    lines unit outerIndentation after outer ((outerIndentation ++ "</" ++ tagName ++ ">") :: out)
+
+        (TextNode text) :: rest ->
+            lines unit indentation rest open ((indentation ++ textIn open text) :: out)
+
+        (Node tagName attributes children) :: rest ->
+            let
+                start =
+                    indentation ++ startTag tagName attributes
+            in
+            case children of
+                NoChildren ->
+                    lines unit indentation rest open (start :: out)
+
+                Regular [] ->
+                    if isVoid tagName then
+                        lines unit indentation rest open (start :: out)
+
+                    else
+                        lines unit indentation rest open ((indentation ++ "</" ++ tagName ++ ">") :: start :: out)
+
+                Regular inner ->
+                    lines unit (indentation ++ unit) inner (( tagName, rest ) :: open) (start :: out)
+
+                Keyed inner ->
+                    lines unit (indentation ++ unit) (List.map Tuple.second inner) (( tagName, rest ) :: open) (start :: out)
+
+
+{-| A text as its parent element reads it: escaped, but in a `script` or a `style`, whose text the
+browser reads as it is, where only a `</` that would close the element is guarded.
+-}
+textIn : Open msg -> String -> String
+textIn open text =
+    case open of
+        ( parent, _ ) :: _ ->
+            if parent == "script" || parent == "style" then
+                String.replace "</" "<\\/" text
+
+            else
+                escapeText text
+
+        [] ->
+            escapeText text
+
+
+{-| The elements HTML closes on their own: no closing tag is written for them.
+-}
+isVoid : String -> Bool
+isVoid tagName =
+    case tagName of
+        "area" ->
+            True
+
+        "base" ->
+            True
+
+        "br" ->
+            True
+
+        "col" ->
+            True
+
+        "embed" ->
+            True
+
+        "hr" ->
+            True
+
+        "img" ->
+            True
+
+        "input" ->
+            True
+
+        "link" ->
+            True
+
+        "meta" ->
+            True
+
+        "source" ->
+            True
+
+        "track" ->
+            True
+
+        "wbr" ->
+            True
 
         _ ->
-            buildProp "class" (join " " classes) :: attrs
+            False
 
 
-withStyles : List String -> List String -> List String
-withStyles styles attrs =
-    case styles of
+{-| A start tag: `class` and `style` first, each once with every value given, then the other
+attributes in the order written. Events write nothing.
+-}
+startTag : String -> List (Attribute msg) -> String
+startTag tagName attributes =
+    case attributes of
         [] ->
-            attrs
+            "<" ++ tagName ++ ">"
 
         _ ->
-            buildProp "style" (join "; " styles) :: attrs
+            let
+                ( classes, styles ) =
+                    classesAndStyles attributes [] []
+            in
+            "<"
+                ++ tagName
+                ++ joinedAttribute " class=\"" " " classes
+                ++ joinedAttribute " style=\"" "; " styles
+                ++ otherAttributes attributes ""
+                ++ ">"
 
 
-type alias AttrAcc =
-    ( List String, List String, List String )
+{-| An attribute given several times, its values joined; nothing when it is not given.
+-}
+joinedAttribute : String -> String -> List String -> String
+joinedAttribute opening separator values =
+    case values of
+        [] ->
+            ""
+
+        [ value ] ->
+            opening ++ escape value ++ "\""
+
+        _ ->
+            opening ++ escape (String.join separator (List.reverse values)) ++ "\""
 
 
-propName : String -> String
-propName prop =
-    case prop of
+{-| The values of every `class` and `style` among the attributes, last first.
+-}
+classesAndStyles : List (Attribute msg) -> List String -> List String -> ( List String, List String )
+classesAndStyles attributes classes styles =
+    case attributes of
+        [] ->
+            ( classes, styles )
+
+        (StringProperty "className" value) :: rest ->
+            classesAndStyles rest (value :: classes) styles
+
+        (Style key value) :: rest ->
+            classesAndStyles rest classes ((key ++ ": " ++ value) :: styles)
+
+        _ :: rest ->
+            classesAndStyles rest classes styles
+
+
+otherAttributes : List (Attribute msg) -> String -> String
+otherAttributes attributes done =
+    case attributes of
+        [] ->
+            done
+
+        (Attribute key value) :: rest ->
+            otherAttributes rest (done ++ " " ++ key ++ "=\"" ++ escape value ++ "\"")
+
+        (StringProperty "className" _) :: rest ->
+            otherAttributes rest done
+
+        (StringProperty key value) :: rest ->
+            otherAttributes rest (done ++ " " ++ attributeName key ++ "=\"" ++ escape value ++ "\"")
+
+        (BoolProperty key True) :: rest ->
+            otherAttributes rest (done ++ " " ++ attributeName key)
+
+        (BoolProperty _ False) :: rest ->
+            otherAttributes rest done
+
+        (ValueProperty key value) :: rest ->
+            otherAttributes rest (done ++ " " ++ attributeName key ++ "=\"" ++ escape (String.Conversions.fromValue value) ++ "\"")
+
+        (Style _ _) :: rest ->
+            otherAttributes rest done
+
+        (Event _ _) :: rest ->
+            otherAttributes rest done
+
+
+{-| The attribute a property is written as: its HTML name. Every property `Html.String.Attributes`
+sets is named as its attribute but these.
+-}
+attributeName : String -> String
+attributeName property =
+    case property of
         "className" ->
             "class"
-
-        "defaultValue" ->
-            "value"
 
         "htmlFor" ->
             "for"
 
+        "defaultValue" ->
+            "value"
+
+        "acceptCharset" ->
+            "accept-charset"
+
+        "accessKey" ->
+            "accesskey"
+
+        "contentEditable" ->
+            "contenteditable"
+
+        "isMap" ->
+            "ismap"
+
+        "noValidate" ->
+            "novalidate"
+
+        "readOnly" ->
+            "readonly"
+
+        "useMap" ->
+            "usemap"
+
         _ ->
-            prop
+            property
 
 
-buildProp : String -> String -> String
-buildProp key value =
-    hyphenate key ++ "=\"" ++ escape value ++ "\""
-
-
-addAttribute : Attribute msg -> AttrAcc -> AttrAcc
-addAttribute attribute (( classes, styles, attrs ) as acc) =
-    case attribute of
-        Attribute key value ->
-            ( classes, styles, buildProp key value :: attrs )
-
-        StringProperty "className" value ->
-            ( value :: classes
-            , styles
-            , attrs
-            )
-
-        StringProperty string value ->
-            ( classes, styles, buildProp (propName string) value :: attrs )
-
-        BoolProperty string enabled ->
-            if enabled then
-                ( classes, styles, hyphenate (propName string) :: attrs )
-
-            else
-                acc
-
-        ValueProperty string value ->
-            ( classes
-            , styles
-            , buildProp (propName string) (String.Conversions.fromValue value) :: attrs
-            )
-
-        Style key value ->
-            ( classes
-            , (escape key ++ ": " ++ escape value) :: styles
-            , attrs
-            )
-
-        Event _ _ ->
-            acc
-
-
+{-| An attribute's value as HTML reads it back: `&`, `"`, `<` and `>` as entities. Most values
+have none, so one search comes before any replacing.
+-}
 escape : String -> String
-escape =
-    String.foldl
-        (\char acc ->
-            if char == '"' then
-                acc ++ "\\\""
+escape value =
+    if Regex.contains special value then
+        Regex.replace special entity value
 
-            else
-                acc ++ String.fromChar char
-        )
-        ""
+    else
+        value
 
 
-hyphenate : String -> String
-hyphenate =
-    String.foldl
-        (\char acc ->
-            if Char.isUpper char then
-                acc ++ "-" ++ String.fromChar (Char.toLower char)
+{-| A text as HTML reads it back: `&`, `<` and `>` as entities, quotes as they are.
+-}
+escapeText : String -> String
+escapeText text =
+    if Regex.contains textSpecial text then
+        Regex.replace textSpecial entity text
 
-            else
-                acc ++ String.fromChar char
-        )
-        ""
+    else
+        text
 
 
-closingTag : String -> String
-closingTag tagName =
-    "</" ++ tagName ++ ">"
+special : Regex
+special =
+    Regex.fromString "[&\"<>]" |> Maybe.withDefault Regex.never
 
 
-indent : Int -> Int -> String -> String
-indent perLevel level x =
-    String.repeat (perLevel * level) " " ++ x
+textSpecial : Regex
+textSpecial =
+    Regex.fromString "[&<>]" |> Maybe.withDefault Regex.never
+
+
+entity : Regex.Match -> String
+entity found =
+    case found.match of
+        "&" ->
+            "&amp;"
+
+        "\"" ->
+            "&quot;"
+
+        "<" ->
+            "&lt;"
+
+        _ ->
+            "&gt;"
